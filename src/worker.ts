@@ -388,6 +388,170 @@ async function handleApproveCommand(ctx: PluginContext, responseUrl: string, app
   }
 }
 
+// --- Interactivity handler (extracted so onWebhook can fire-and-forget) ---
+
+async function handleInteractivity(
+  ctx: PluginContext,
+  parsedBody: Record<string, unknown> | undefined,
+): Promise<void> {
+  const payload = parsedBody?.payload
+    ? JSON.parse(String(parsedBody.payload)) as Record<string, unknown>
+    : parsedBody;
+  if (!payload || payload.type !== "block_actions") return;
+
+  const actions = payload.actions as Array<Record<string, unknown>>;
+  const responseUrl = String(payload.response_url ?? "");
+  const user = payload.user as Record<string, unknown> | undefined;
+  const userId = user ? String(user.id ?? user.username ?? "unknown") : "unknown";
+
+  if (!actions?.length || !responseUrl) return;
+
+  const action = actions[0];
+  const actionId = String(action.action_id ?? "");
+  const actionValue = String(action.value ?? "");
+
+  if (!actionValue) return;
+
+  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+  const companyId = companies[0]?.id ?? "";
+
+  // --- Approval buttons ---
+  if (actionId === "approval_approve" || actionId === "approval_reject") {
+    const approved = actionId === "approval_approve";
+    const endpoint = approved ? "approve" : "reject";
+    try {
+      await ctx.http.fetch(
+        `${pluginConfig.paperclipBaseUrl}/api/approvals/${actionValue}/${endpoint}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(paperclipApiKey ? { Authorization: `Bearer ${paperclipApiKey}` } : {}),
+          },
+          body: JSON.stringify({ decidedByUserId: `slack:${userId}` }),
+        },
+      );
+
+      await respondToAction(
+        ctx,
+        pluginToken,
+        responseUrl,
+        formatApprovalResolved(actionValue, approved, userId),
+      );
+      await ctx.metrics.write("slack.approvals.decided", 1, { decision: endpoint });
+    } catch (err) {
+      ctx.logger.warn("Failed to handle approval action", { err, approvalId: actionValue });
+    }
+    return;
+  }
+
+  // --- Escalation buttons ---
+  if (
+    actionId === "escalation_use_suggested" ||
+    actionId === "escalation_reply" ||
+    actionId === "escalation_override" ||
+    actionId === "escalation_dismiss"
+  ) {
+    try {
+      const record = await ctx.state.get({
+        scopeKind: "company",
+        scopeId: companyId,
+        stateKey: STATE_KEYS.escalationRecord(actionValue),
+      }) as Record<string, unknown> | null;
+
+      if (record) {
+        await ctx.state.set(
+          { scopeKind: "company", scopeId: companyId, stateKey: STATE_KEYS.escalationRecord(actionValue) },
+          { ...record, status: "resolved", resolvedAt: new Date().toISOString(), resolvedBy: `slack:${userId}` },
+        );
+      }
+
+      await respondToAction(
+        ctx,
+        pluginToken,
+        responseUrl,
+        formatEscalationResolved(actionValue, actionId, userId),
+      );
+      await ctx.metrics.write("slack.escalations.resolved", 1, { action: actionId });
+    } catch (err) {
+      ctx.logger.warn("Failed to handle escalation action", { err, escalationId: actionValue });
+    }
+    return;
+  }
+
+  // --- Handoff buttons ---
+  if (actionId === "handoff_approve" || actionId === "handoff_reject") {
+    try {
+      const approved = actionId === "handoff_approve";
+      await handleHandoffAction(ctx, pluginToken, companyId, actionValue, approved, userId);
+
+      const emoji = approved ? ":white_check_mark:" : ":x:";
+      const label = approved ? "Approved" : "Rejected";
+      await respondToAction(ctx, pluginToken, responseUrl, {
+        text: `Handoff ${label} by ${userId}`,
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `${emoji} *Handoff ${label}* by <@${userId}>`,
+            },
+          },
+        ],
+      });
+    } catch (err) {
+      ctx.logger.warn("Failed to handle handoff action", { err, handoffId: actionValue });
+    }
+    return;
+  }
+
+  // --- Discussion loop buttons ---
+  if (actionId === "discussion_continue" || actionId === "discussion_stop") {
+    try {
+      const discAction = actionId === "discussion_continue" ? "continue" as const : "stop" as const;
+      await handleDiscussionAction(ctx, pluginToken, companyId, actionValue, discAction, userId);
+
+      const emoji = discAction === "continue" ? ":arrow_forward:" : ":stop_button:";
+      const label = discAction === "continue" ? "Resumed" : "Stopped";
+      await respondToAction(ctx, pluginToken, responseUrl, {
+        text: `Discussion ${label} by ${userId}`,
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `${emoji} *Discussion ${label}* by <@${userId}>`,
+            },
+          },
+        ],
+      });
+    } catch (err) {
+      ctx.logger.warn("Failed to handle discussion action", { err, discussionId: actionValue });
+    }
+    return;
+  }
+
+  // --- Command step approval buttons (Phase 4) ---
+  if (actionId === "command_step_approve" || actionId === "command_step_reject") {
+    const approved = actionId === "command_step_approve";
+    const emoji = approved ? ":white_check_mark:" : ":x:";
+    const label = approved ? "Approved" : "Rejected";
+    await respondToAction(ctx, pluginToken, responseUrl, {
+      text: `Step ${label} by ${userId}`,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `${emoji} *Step ${label}* by <@${userId}>`,
+          },
+        },
+      ],
+    });
+    return;
+  }
+}
+
 // --- Plugin definition ---
 
 const plugin = definePlugin({
@@ -1330,170 +1494,25 @@ const plugin = definePlugin({
       }
     }
 
-    // Slash commands
+    // Slash commands — Slack enforces a ≤3s HTTP response. paperclip awaits
+    // onWebhook before sending the response, and handleSlashCommand can take
+    // multiple seconds (paperclip API calls + Slack response_url post).
+    // Fire-and-forget so onWebhook returns immediately; the actual reply
+    // arrives in-channel via Slack's response_url.
     if (input.endpointKey === WEBHOOK_KEYS.slashCommand) {
-      await handleSlashCommand(pluginCtx, input.rawBody);
+      void handleSlashCommand(pluginCtx, input.rawBody).catch((err) => {
+        pluginCtx.logger.error("slash command handler failed", { err });
+      });
       return;
     }
 
-    // Interactivity (button clicks)
+    // Interactivity (button clicks) — Slack enforces a ≤3s ack. Fire-and-forget
+    // so onWebhook returns immediately; updates post via response_url.
     if (input.endpointKey === WEBHOOK_KEYS.interactivity) {
-      const payload = body?.payload
-        ? JSON.parse(String(body.payload)) as Record<string, unknown>
-        : body;
-      if (!payload || payload.type !== "block_actions") return;
-
-      const actions = payload.actions as Array<Record<string, unknown>>;
-      const responseUrl = String(payload.response_url ?? "");
-      const user = payload.user as Record<string, unknown> | undefined;
-      const userId = user ? String(user.id ?? user.username ?? "unknown") : "unknown";
-
-      if (!actions?.length || !responseUrl) return;
-
-      const action = actions[0];
-      const actionId = String(action.action_id ?? "");
-      const actionValue = String(action.value ?? "");
-
-      if (!actionValue) return;
-
-      const companies = await pluginCtx.companies.list({ limit: 1, offset: 0 });
-      const companyId = companies[0]?.id ?? "";
-
-      // --- Approval buttons ---
-      if (actionId === "approval_approve" || actionId === "approval_reject") {
-        const approved = actionId === "approval_approve";
-        const endpoint = approved ? "approve" : "reject";
-        try {
-          await pluginCtx.http.fetch(
-            `${pluginConfig.paperclipBaseUrl}/api/approvals/${actionValue}/${endpoint}`,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                ...(paperclipApiKey ? { Authorization: `Bearer ${paperclipApiKey}` } : {}),
-              },
-              body: JSON.stringify({ decidedByUserId: `slack:${userId}` }),
-            },
-          );
-
-          await respondToAction(
-            pluginCtx,
-            pluginToken,
-            responseUrl,
-            formatApprovalResolved(actionValue, approved, userId),
-          );
-          await pluginCtx.metrics.write("slack.approvals.decided", 1, { decision: endpoint });
-        } catch (err) {
-          pluginCtx.logger.warn("Failed to handle approval action", { err, approvalId: actionValue });
-        }
-        return;
-      }
-
-      // --- Escalation buttons ---
-      if (
-        actionId === "escalation_use_suggested" ||
-        actionId === "escalation_reply" ||
-        actionId === "escalation_override" ||
-        actionId === "escalation_dismiss"
-      ) {
-        try {
-          const record = await pluginCtx.state.get({
-            scopeKind: "company",
-            scopeId: companyId,
-            stateKey: STATE_KEYS.escalationRecord(actionValue),
-          }) as Record<string, unknown> | null;
-
-          if (record) {
-            await pluginCtx.state.set(
-              { scopeKind: "company", scopeId: companyId, stateKey: STATE_KEYS.escalationRecord(actionValue) },
-              { ...record, status: "resolved", resolvedAt: new Date().toISOString(), resolvedBy: `slack:${userId}` },
-            );
-          }
-
-          await respondToAction(
-            pluginCtx,
-            pluginToken,
-            responseUrl,
-            formatEscalationResolved(actionValue, actionId, userId),
-          );
-          await pluginCtx.metrics.write("slack.escalations.resolved", 1, { action: actionId });
-        } catch (err) {
-          pluginCtx.logger.warn("Failed to handle escalation action", { err, escalationId: actionValue });
-        }
-        return;
-      }
-
-      // --- Handoff buttons ---
-      if (actionId === "handoff_approve" || actionId === "handoff_reject") {
-        try {
-          const approved = actionId === "handoff_approve";
-          await handleHandoffAction(pluginCtx, pluginToken, companyId, actionValue, approved, userId);
-
-          const emoji = approved ? ":white_check_mark:" : ":x:";
-          const label = approved ? "Approved" : "Rejected";
-          await respondToAction(pluginCtx, pluginToken, responseUrl, {
-            text: `Handoff ${label} by ${userId}`,
-            blocks: [
-              {
-                type: "section",
-                text: {
-                  type: "mrkdwn",
-                  text: `${emoji} *Handoff ${label}* by <@${userId}>`,
-                },
-              },
-            ],
-          });
-        } catch (err) {
-          pluginCtx.logger.warn("Failed to handle handoff action", { err, handoffId: actionValue });
-        }
-        return;
-      }
-
-      // --- Discussion loop buttons ---
-      if (actionId === "discussion_continue" || actionId === "discussion_stop") {
-        try {
-          const discAction = actionId === "discussion_continue" ? "continue" as const : "stop" as const;
-          await handleDiscussionAction(pluginCtx, pluginToken, companyId, actionValue, discAction, userId);
-
-          const emoji = discAction === "continue" ? ":arrow_forward:" : ":stop_button:";
-          const label = discAction === "continue" ? "Resumed" : "Stopped";
-          await respondToAction(pluginCtx, pluginToken, responseUrl, {
-            text: `Discussion ${label} by ${userId}`,
-            blocks: [
-              {
-                type: "section",
-                text: {
-                  type: "mrkdwn",
-                  text: `${emoji} *Discussion ${label}* by <@${userId}>`,
-                },
-              },
-            ],
-          });
-        } catch (err) {
-          pluginCtx.logger.warn("Failed to handle discussion action", { err, discussionId: actionValue });
-        }
-        return;
-      }
-
-      // --- Command step approval buttons (Phase 4) ---
-      if (actionId === "command_step_approve" || actionId === "command_step_reject") {
-        const approved = actionId === "command_step_approve";
-        const emoji = approved ? ":white_check_mark:" : ":x:";
-        const label = approved ? "Approved" : "Rejected";
-        await respondToAction(pluginCtx, pluginToken, responseUrl, {
-          text: `Step ${label} by ${userId}`,
-          blocks: [
-            {
-              type: "section",
-              text: {
-                type: "mrkdwn",
-                text: `${emoji} *Step ${label}* by <@${userId}>`,
-              },
-            },
-          ],
-        });
-        return;
-      }
+      void handleInteractivity(pluginCtx, body).catch((err) => {
+        pluginCtx.logger.error("interactivity handler failed", { err });
+      });
+      return;
     }
   },
 
