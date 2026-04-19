@@ -26,6 +26,7 @@ import {
 import {
   setBaseUrl,
   setCompanyPrefix,
+  prependMentions,
   formatIssueCreated,
   formatIssueDone,
   formatApprovalCreated,
@@ -61,6 +62,121 @@ let slackAdapter: SlackAdapter;
 // Used to authenticate privileged calls (approve/reject) that require
 // assertBoard. Empty when not configured — dependent actions will fail.
 let paperclipApiKey = "";
+
+// --- Team directory (issue label → user mention) ---
+// Sourced from the `team-directory` company skill's fenced JSON block.
+// Cached in-memory for TEAM_DIRECTORY_TTL_MS per companyId.
+
+type TeamDirectoryOwner = {
+  slackUserId?: string;
+  slackUserIds?: string[];
+  githubUsername?: string;
+  githubUsernames?: string[];
+};
+type TeamDirectory = Record<string, TeamDirectoryOwner>;
+
+const TEAM_DIRECTORY_TTL_MS = 5 * 60 * 1000;
+const teamDirectoryCache = new Map<string, { data: TeamDirectory; expiresAt: number }>();
+
+async function fetchTeamDirectory(companyId: string): Promise<TeamDirectory> {
+  const now = Date.now();
+  const cached = teamDirectoryCache.get(companyId);
+  if (cached && cached.expiresAt > now) return cached.data;
+
+  const authHeaders: Record<string, string> = paperclipApiKey
+    ? { Authorization: `Bearer ${paperclipApiKey}` }
+    : {};
+
+  try {
+    const listRes = await pluginCtx.http.fetch(
+      `${pluginConfig.paperclipBaseUrl}/api/companies/${companyId}/skills`,
+      { headers: authHeaders },
+    );
+    if (!listRes.ok) {
+      pluginCtx.logger.warn("team-directory: skills list fetch failed", {
+        status: listRes.status,
+        companyId,
+      });
+      return cacheAndReturn(companyId, {});
+    }
+    const skills = (await listRes.json()) as Array<{ id: string; slug: string }>;
+    const match = skills.find((s) => s.slug === "team-directory");
+    if (!match) return cacheAndReturn(companyId, {});
+
+    const detailRes = await pluginCtx.http.fetch(
+      `${pluginConfig.paperclipBaseUrl}/api/companies/${companyId}/skills/${match.id}`,
+      { headers: authHeaders },
+    );
+    if (!detailRes.ok) {
+      pluginCtx.logger.warn("team-directory: skill detail fetch failed", {
+        status: detailRes.status,
+        skillId: match.id,
+      });
+      return cacheAndReturn(companyId, {});
+    }
+    const skill = (await detailRes.json()) as { markdown?: string };
+    const md = skill.markdown ?? "";
+    const fenced = md.match(/```json\s*\n([\s\S]*?)\n```/);
+    if (!fenced) return cacheAndReturn(companyId, {});
+    try {
+      const parsed = JSON.parse(fenced[1]) as TeamDirectory;
+      return cacheAndReturn(companyId, parsed);
+    } catch (parseErr) {
+      pluginCtx.logger.warn("team-directory: JSON parse failed", {
+        err: String(parseErr),
+      });
+      return cacheAndReturn(companyId, {});
+    }
+  } catch (err) {
+    pluginCtx.logger.warn("team-directory: fetch error", { err: String(err), companyId });
+    return cacheAndReturn(companyId, {});
+  }
+}
+
+function cacheAndReturn(companyId: string, data: TeamDirectory): TeamDirectory {
+  teamDirectoryCache.set(companyId, { data, expiresAt: Date.now() + TEAM_DIRECTORY_TTL_MS });
+  return data;
+}
+
+async function resolveMentionsFromEvent(event: PluginEvent): Promise<string> {
+  const dir = await fetchTeamDirectory(event.companyId);
+  if (Object.keys(dir).length === 0) return "";
+
+  const p = event.payload as Record<string, unknown>;
+  const issueIds = Array.isArray(p.issueIds) ? (p.issueIds as string[]) : [];
+  if (issueIds.length === 0) return "";
+
+  const authHeaders: Record<string, string> = paperclipApiKey
+    ? { Authorization: `Bearer ${paperclipApiKey}` }
+    : {};
+  const slackIds = new Set<string>();
+
+  for (const iid of issueIds) {
+    try {
+      const res = await pluginCtx.http.fetch(
+        `${pluginConfig.paperclipBaseUrl}/api/companies/${event.companyId}/issues/${iid}`,
+        { headers: authHeaders },
+      );
+      if (!res.ok) continue;
+      const body = (await res.json()) as { labels?: Array<{ name: string }> };
+      for (const label of body.labels ?? []) {
+        const owner = dir[label.name];
+        if (!owner) continue;
+        if (owner.slackUserId) slackIds.add(owner.slackUserId);
+        if (Array.isArray(owner.slackUserIds)) {
+          for (const u of owner.slackUserIds) slackIds.add(u);
+        }
+      }
+    } catch (err) {
+      pluginCtx.logger.warn("resolveMentions: issue fetch failed", {
+        issueId: iid,
+        err: String(err),
+      });
+    }
+  }
+
+  return [...slackIds].map((u) => `<@${u}>`).join(" ");
+}
 
 // --- Slack signature verification ---
 
@@ -1020,7 +1136,15 @@ const plugin = definePlugin({
 
     if (config.notifyOnApprovalCreated) {
       ctx.events.on("approval.created", async (event: PluginEvent) => {
-        await notify(event, formatApprovalCreated, config.approvalsChannelId);
+        const mentions = await resolveMentionsFromEvent(event);
+        await notify(
+          event,
+          (e) =>
+            mentions
+              ? prependMentions(formatApprovalCreated(e), mentions)
+              : formatApprovalCreated(e),
+          config.approvalsChannelId,
+        );
       });
     }
 

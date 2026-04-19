@@ -19,6 +19,22 @@ export function setCompanyPrefix(prefix: string) {
   companyPrefix = prefix ? `/${prefix.replace(/^\/+|\/+$/g, "")}` : "";
 }
 
+export function prependMentions(msg: SlackMessage, mentions: string): SlackMessage {
+  if (!mentions) return msg;
+  // text field drives push notification preview on mobile; prepend there too.
+  msg.text = `${mentions} ${msg.text ?? ""}`;
+  if (Array.isArray(msg.blocks) && msg.blocks.length > 0) {
+    const first = msg.blocks[0] as Record<string, unknown>;
+    if (first.type === "section" && typeof first.text === "object" && first.text !== null) {
+      const t = first.text as Record<string, unknown>;
+      if (t.type === "mrkdwn" && typeof t.text === "string") {
+        t.text = `${mentions}\n${t.text}`;
+      }
+    }
+  }
+  return msg;
+}
+
 function contextFooter(timestamp?: string): Record<string, unknown> {
   const elements: Array<Record<string, unknown>> = [
     { type: "mrkdwn", text: "Paperclip" },
