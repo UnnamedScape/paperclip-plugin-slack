@@ -25,6 +25,7 @@ import {
 } from "./acp-bridge.js";
 import {
   setBaseUrl,
+  setCompanyPrefix,
   formatIssueCreated,
   formatIssueDone,
   formatApprovalCreated,
@@ -56,6 +57,10 @@ let pluginCtx: PluginContext;
 let pluginToken: string;
 let pluginConfig: SlackConfig;
 let slackAdapter: SlackAdapter;
+// Paperclip board API key, resolved from paperclipApiKeyRef at startup.
+// Used to authenticate privileged calls (approve/reject) that require
+// assertBoard. Empty when not configured — dependent actions will fail.
+let paperclipApiKey = "";
 
 // --- Slack signature verification ---
 
@@ -368,7 +373,10 @@ async function handleApproveCommand(ctx: PluginContext, responseUrl: string, app
       `${pluginConfig.paperclipBaseUrl}/api/approvals/${approvalId}/approve`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(paperclipApiKey ? { Authorization: `Bearer ${paperclipApiKey}` } : {}),
+        },
         body: JSON.stringify({ decidedByUserId: "slack:command" }),
       },
     );
@@ -409,6 +417,31 @@ const plugin = definePlugin({
       } catch {
         ctx.logger.warn("Slack signing secret not configured — webhook signature verification disabled");
       }
+    }
+
+    // Resolve Paperclip board API key. Required for approve/reject, which hit
+    // endpoints guarded by assertBoard(). Without it, those actions return
+    // HTTP 401/403 and the Slack button click silently fails.
+    if (config.paperclipApiKeyRef) {
+      try {
+        paperclipApiKey = await ctx.secrets.resolve(config.paperclipApiKeyRef);
+      } catch {
+        ctx.logger.warn("Paperclip API key not configured — approve/reject buttons will fail");
+      }
+    } else {
+      ctx.logger.warn("paperclipApiKeyRef not set — Slack approve/reject buttons will fail");
+    }
+
+    // Resolve the company's issuePrefix once and set it on the formatter so
+    // View URLs include it (paperclip UI routes live under /<prefix>/...).
+    try {
+      const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+      const first = companies[0] as { issuePrefix?: string } | undefined;
+      if (first?.issuePrefix) {
+        setCompanyPrefix(first.issuePrefix);
+      }
+    } catch (err) {
+      ctx.logger.warn("Failed to resolve issuePrefix for URL formatting", { err });
     }
 
     // =========================================================================
@@ -1335,7 +1368,10 @@ const plugin = definePlugin({
             `${pluginConfig.paperclipBaseUrl}/api/approvals/${actionValue}/${endpoint}`,
             {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: {
+                "Content-Type": "application/json",
+                ...(paperclipApiKey ? { Authorization: `Bearer ${paperclipApiKey}` } : {}),
+              },
               body: JSON.stringify({ decidedByUserId: `slack:${userId}` }),
             },
           );

@@ -59,6 +59,13 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Secret UUID for your Slack app's Signing Secret. Required to verify that incoming webhooks are genuinely from Slack.",
         default: DEFAULT_CONFIG.slackSigningSecretRef,
       },
+      paperclipApiKeyRef: {
+        type: "string",
+        format: "secret-ref",
+        title: "Paperclip Board API Key (secret reference)",
+        description: "Secret UUID for a Paperclip board API key (e.g. pcp_board_...). Required so the plugin can approve/reject from Slack buttons (those API endpoints require board auth).",
+        default: "",
+      },
       defaultChannelId: {
         type: "string",
         title: "Default Slack Channel ID",

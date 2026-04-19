@@ -5,9 +5,18 @@ import type { EscalationRecord } from "./types.js";
 type Payload = Record<string, unknown>;
 
 let dashboardBase = "http://localhost:3100";
+let companyPrefix = "";
 
 export function setBaseUrl(url: string) {
   dashboardBase = url.replace(/\/+$/, "");
+}
+
+// Paperclip's UI routes are prefixed with the company's issuePrefix
+// (e.g. /UNN/approvals/<id>). Without it, the UI responds
+// "Company not found". setCompanyPrefix is called from worker setup once
+// the company is resolved.
+export function setCompanyPrefix(prefix: string) {
+  companyPrefix = prefix ? `/${prefix.replace(/^\/+|\/+$/g, "")}` : "";
 }
 
 function contextFooter(timestamp?: string): Record<string, unknown> {
@@ -91,7 +100,7 @@ export function formatIssueCreated(event: PluginEvent): SlackMessage {
           ? `*New issue created*\n*${identifier}* ${title}\n> ${description}`
           : `*New issue created*\n*${identifier}* ${title}`,
       },
-      accessory: viewButton("View Issue", `${dashboardBase}/issues/${event.entityId}`),
+      accessory: viewButton("View Issue", `${dashboardBase}${companyPrefix}/issues/${event.entityId}`),
     },
   ];
 
@@ -123,7 +132,7 @@ export function formatIssueDone(event: PluginEvent): SlackMessage {
         type: "mrkdwn",
         text: `*Issue completed* :white_check_mark:\n*${identifier}* ${title} is now done.`,
       },
-      accessory: viewButton("View Issue", `${dashboardBase}/issues/${event.entityId}`),
+      accessory: viewButton("View Issue", `${dashboardBase}${companyPrefix}/issues/${event.entityId}`),
     },
   ];
 
@@ -191,7 +200,7 @@ export function formatApprovalCreated(event: PluginEvent): SlackMessage {
       {
         type: "button",
         text: { type: "plain_text", text: "View" },
-        url: `${dashboardBase}/approvals/${approvalId}`,
+        url: `${dashboardBase}${companyPrefix}/approvals/${approvalId}`,
         action_id: "approval_view",
       },
     ],
@@ -222,7 +231,7 @@ export function formatApprovalResolved(
           type: "mrkdwn",
           text: `${emoji} *${action}* by <@${userId}>`,
         },
-        accessory: viewButton("View", `${dashboardBase}/approvals/${approvalId}`),
+        accessory: viewButton("View", `${dashboardBase}${companyPrefix}/approvals/${approvalId}`),
       },
     ],
   };
