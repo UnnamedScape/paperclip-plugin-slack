@@ -63,20 +63,55 @@ let slackAdapter: SlackAdapter;
 // assertBoard. Empty when not configured — dependent actions will fail.
 let paperclipApiKey = "";
 
-// --- Team directory (issue label → user mention) ---
+// --- Team directory ---
 // Sourced from the `team-directory` company skill's fenced JSON block.
 // Cached in-memory for TEAM_DIRECTORY_TTL_MS per companyId.
+//
+// Supports two structures:
+//   1. Nested (new): { users: {...}, labels: {...}, _default: {userId} }
+//   2. Flat (legacy): { <labelName>: {slackUserId, ...} }
+// fetchTeamDirectory normalises to the nested shape.
 
 type TeamDirectoryOwner = {
+  name?: string;
   slackUserId?: string;
   slackUserIds?: string[];
   githubUsername?: string;
   githubUsernames?: string[];
 };
-type TeamDirectory = Record<string, TeamDirectoryOwner>;
+type TeamDirectory = {
+  users: Record<string, TeamDirectoryOwner>;
+  labels: Record<string, TeamDirectoryOwner>;
+  defaultUserId: string | null;
+};
 
+const EMPTY_DIRECTORY: TeamDirectory = { users: {}, labels: {}, defaultUserId: null };
 const TEAM_DIRECTORY_TTL_MS = 5 * 60 * 1000;
 const teamDirectoryCache = new Map<string, { data: TeamDirectory; expiresAt: number }>();
+
+function normaliseTeamDirectory(raw: unknown): TeamDirectory {
+  if (!raw || typeof raw !== "object") return EMPTY_DIRECTORY;
+  const obj = raw as Record<string, unknown>;
+
+  // New nested structure
+  if (obj.users || obj.labels || obj._default) {
+    const users = (obj.users as Record<string, TeamDirectoryOwner> | undefined) ?? {};
+    const labels = (obj.labels as Record<string, TeamDirectoryOwner> | undefined) ?? {};
+    const defaultBlock = obj._default as { userId?: string } | undefined;
+    return {
+      users: users ?? {},
+      labels: labels ?? {},
+      defaultUserId: defaultBlock?.userId ?? null,
+    };
+  }
+
+  // Legacy flat structure — every key is a label
+  const labels: Record<string, TeamDirectoryOwner> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v && typeof v === "object") labels[k] = v as TeamDirectoryOwner;
+  }
+  return { users: {}, labels, defaultUserId: null };
+}
 
 async function fetchTeamDirectory(companyId: string): Promise<TeamDirectory> {
   const now = Date.now();
@@ -97,11 +132,11 @@ async function fetchTeamDirectory(companyId: string): Promise<TeamDirectory> {
         status: listRes.status,
         companyId,
       });
-      return cacheAndReturn(companyId, {});
+      return cacheAndReturn(companyId, EMPTY_DIRECTORY);
     }
     const skills = (await listRes.json()) as Array<{ id: string; slug: string }>;
     const match = skills.find((s) => s.slug === "team-directory");
-    if (!match) return cacheAndReturn(companyId, {});
+    if (!match) return cacheAndReturn(companyId, EMPTY_DIRECTORY);
 
     const detailRes = await pluginCtx.http.fetch(
       `${pluginConfig.paperclipBaseUrl}/api/companies/${companyId}/skills/${match.id}`,
@@ -112,24 +147,24 @@ async function fetchTeamDirectory(companyId: string): Promise<TeamDirectory> {
         status: detailRes.status,
         skillId: match.id,
       });
-      return cacheAndReturn(companyId, {});
+      return cacheAndReturn(companyId, EMPTY_DIRECTORY);
     }
     const skill = (await detailRes.json()) as { markdown?: string };
     const md = skill.markdown ?? "";
     const fenced = md.match(/```json\s*\n([\s\S]*?)\n```/);
-    if (!fenced) return cacheAndReturn(companyId, {});
+    if (!fenced) return cacheAndReturn(companyId, EMPTY_DIRECTORY);
     try {
-      const parsed = JSON.parse(fenced[1]) as TeamDirectory;
-      return cacheAndReturn(companyId, parsed);
+      const parsed = JSON.parse(fenced[1]);
+      return cacheAndReturn(companyId, normaliseTeamDirectory(parsed));
     } catch (parseErr) {
       pluginCtx.logger.warn("team-directory: JSON parse failed", {
         err: String(parseErr),
       });
-      return cacheAndReturn(companyId, {});
+      return cacheAndReturn(companyId, EMPTY_DIRECTORY);
     }
   } catch (err) {
     pluginCtx.logger.warn("team-directory: fetch error", { err: String(err), companyId });
-    return cacheAndReturn(companyId, {});
+    return cacheAndReturn(companyId, EMPTY_DIRECTORY);
   }
 }
 
@@ -140,7 +175,7 @@ function cacheAndReturn(companyId: string, data: TeamDirectory): TeamDirectory {
 
 async function resolveMentionsFromEvent(event: PluginEvent): Promise<string> {
   const dir = await fetchTeamDirectory(event.companyId);
-  if (Object.keys(dir).length === 0) return "";
+  if (Object.keys(dir.labels).length === 0) return "";
 
   const p = event.payload as Record<string, unknown>;
   const issueIds = Array.isArray(p.issueIds) ? (p.issueIds as string[]) : [];
@@ -160,7 +195,7 @@ async function resolveMentionsFromEvent(event: PluginEvent): Promise<string> {
       if (!res.ok) continue;
       const body = (await res.json()) as { labels?: Array<{ name: string }> };
       for (const label of body.labels ?? []) {
-        const owner = dir[label.name];
+        const owner = dir.labels[label.name];
         if (!owner) continue;
         if (owner.slackUserId) slackIds.add(owner.slackUserId);
         if (Array.isArray(owner.slackUserIds)) {
@@ -176,6 +211,122 @@ async function resolveMentionsFromEvent(event: PluginEvent): Promise<string> {
   }
 
   return [...slackIds].map((u) => `<@${u}>`).join(" ");
+}
+
+// --- notify-board action: walk parent chain for createdByUserId, resolve via
+// team-directory.users, post @mention to Slack. ---
+
+async function resolveUserFromIssueChain(companyId: string, startIssueId: string): Promise<string | null> {
+  const authHeaders: Record<string, string> = paperclipApiKey
+    ? { Authorization: `Bearer ${paperclipApiKey}` }
+    : {};
+  let currentId: string | null = startIssueId;
+  for (let depth = 0; depth < 5 && currentId; depth += 1) {
+    try {
+      const res = await pluginCtx.http.fetch(
+        `${pluginConfig.paperclipBaseUrl}/api/companies/${companyId}/issues/${currentId}`,
+        { headers: authHeaders },
+      );
+      if (!res.ok) return null;
+      const issue = (await res.json()) as { createdByUserId?: string | null; parentId?: string | null };
+      if (issue.createdByUserId) return issue.createdByUserId;
+      currentId = issue.parentId ?? null;
+    } catch (err) {
+      pluginCtx.logger.warn("resolveUserFromIssueChain: fetch failed", {
+        issueId: currentId,
+        err: String(err),
+      });
+      return null;
+    }
+  }
+  return null;
+}
+
+async function handleNotifyBoardAction(params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const companyId = String(params.companyId ?? "");
+  const issueId = String(params.issueId ?? "");
+  const reason = String(params.reason ?? "");
+  const approvalId = params.approvalId ? String(params.approvalId) : null;
+  const channelOverride = params.channelId ? String(params.channelId) : null;
+
+  if (!companyId || !issueId || !reason) {
+    return { ok: false, reason: "missing_required_fields" };
+  }
+
+  const dir = await fetchTeamDirectory(companyId);
+  let resolvedUserId = await resolveUserFromIssueChain(companyId, issueId);
+  if (!resolvedUserId) {
+    resolvedUserId = dir.defaultUserId;
+  }
+  if (!resolvedUserId) {
+    pluginCtx.logger.warn("notify-board: no user resolved (chain empty, no _default)", {
+      companyId,
+      issueId,
+    });
+    return { ok: false, reason: "no_user_resolved" };
+  }
+
+  const owner = dir.users[resolvedUserId];
+  if (!owner || !owner.slackUserId) {
+    pluginCtx.logger.warn("notify-board: user not in team-directory.users", {
+      resolvedUserId,
+    });
+    return { ok: false, reason: "user_not_in_directory", notifiedUserId: resolvedUserId };
+  }
+
+  const channelId = channelOverride ?? pluginConfig.approvalsChannelId ?? pluginConfig.defaultChannelId;
+  if (!channelId) {
+    return { ok: false, reason: "no_channel_configured" };
+  }
+
+  // Fetch issue for link context
+  let issueLink = "";
+  try {
+    const authHeaders: Record<string, string> = paperclipApiKey
+      ? { Authorization: `Bearer ${paperclipApiKey}` }
+      : {};
+    const res = await pluginCtx.http.fetch(
+      `${pluginConfig.paperclipBaseUrl}/api/companies/${companyId}/issues/${issueId}`,
+      { headers: authHeaders },
+    );
+    if (res.ok) {
+      const issue = (await res.json()) as { identifier?: string; title?: string };
+      if (issue.identifier) {
+        const prefix = issue.identifier.split("-")[0];
+        issueLink = `<${pluginConfig.paperclipBaseUrl}/${prefix}/issues/${issue.identifier}|${issue.identifier} · ${issue.title ?? ""}>`;
+      }
+    }
+  } catch { /* best-effort */ }
+
+  const approvalLink = approvalId
+    ? `<${pluginConfig.paperclipBaseUrl}/approvals/${approvalId}|Approval>`
+    : "";
+
+  const mention = `<@${owner.slackUserId}>`;
+  const textParts = [`${mention} 🔔 Board 확인 요청`, reason];
+  if (issueLink) textParts.push(issueLink);
+  if (approvalLink) textParts.push(approvalLink);
+  const text = textParts.join("\n");
+
+  try {
+    const result = await postMessage(pluginCtx, pluginToken, channelId, {
+      text,
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text },
+        },
+      ],
+    });
+    if (!result.ok) {
+      return { ok: false, reason: "slack_post_failed", error: result.error, notifiedUserId: resolvedUserId };
+    }
+    await pluginCtx.metrics.write("slack.notify_board.sent", 1);
+    return { ok: true, slackTs: result.ts, notifiedUserId: resolvedUserId };
+  } catch (err) {
+    pluginCtx.logger.warn("notify-board: post failed", { err: String(err) });
+    return { ok: false, reason: "slack_post_exception", notifiedUserId: resolvedUserId };
+  }
 }
 
 // --- Slack signature verification ---
@@ -1231,6 +1382,12 @@ const plugin = definePlugin({
       );
       ctx.logger.info("Updated Slack channel mapping", { companyId, channelId });
       return { ok: true };
+    });
+
+    // notify-board: agent-invoked Slack @mention. See handleNotifyBoardAction
+    // above for chain walk + team-directory resolution + Slack post logic.
+    ctx.actions.register("notify-board", async (params) => {
+      return handleNotifyBoardAction(params as Record<string, unknown>);
     });
 
     // =========================================================================
