@@ -288,6 +288,51 @@ async function resolveUserFromIssueChain(companyId: string, startIssueId: string
   return null;
 }
 
+// approval.created events arrive with a minimal payload derived from the
+// activity_log entry ({type, issueIds}). The richer per-approval data — title,
+// description, pullRequestUrl, etc. — lives on the approval row's `payload`
+// jsonb. Fetch and merge so the downstream formatter can render a useful card.
+async function enrichApprovalEvent(event: PluginEvent): Promise<PluginEvent> {
+  const approvalId = String(event.entityId ?? "");
+  if (!approvalId) return event;
+  const authHeaders: Record<string, string> = paperclipApiKey
+    ? { Authorization: `Bearer ${paperclipApiKey}` }
+    : {};
+  try {
+    const url = `${pluginConfig.paperclipBaseUrl}/api/approvals/${approvalId}`;
+    const res = await pluginCtx.http.fetch(url, { headers: authHeaders });
+    if (!res.ok) {
+      pluginCtx.logger.warn("enrichApprovalEvent: fetch non-OK", {
+        approvalId,
+        status: res.status,
+        url,
+      });
+      return event;
+    }
+    const approval = (await res.json()) as {
+      payload?: Record<string, unknown>;
+      type?: string;
+      requestedByAgentId?: string | null;
+    };
+    const base = (event.payload as Record<string, unknown>) ?? {};
+    const merged: Record<string, unknown> = {
+      ...base,
+      ...(approval.payload ?? {}),
+      approvalId,
+    };
+    // activity_log.details already carries `type`; prefer it over payload in case
+    // the agent nested a different semantic `type` field inside payload.
+    if (base.type !== undefined) merged.type = base.type;
+    return { ...event, payload: merged };
+  } catch (err) {
+    pluginCtx.logger.warn("enrichApprovalEvent: error", {
+      approvalId,
+      err: String(err),
+    });
+    return event;
+  }
+}
+
 async function handleNotifyBoardAction(params: Record<string, unknown>): Promise<Record<string, unknown>> {
   const companyId = String(params.companyId ?? "");
   const issueId = String(params.issueId ?? "");
@@ -1363,9 +1408,12 @@ const plugin = definePlugin({
 
     if (config.notifyOnApprovalCreated) {
       ctx.events.on("approval.created", async (event: PluginEvent) => {
-        const mentions = await resolveMentionsFromEvent(event);
+        // Enrich first so mention resolution and the formatter both see the
+        // full approval payload (title, description, pullRequestUrl, …).
+        const enriched = await enrichApprovalEvent(event);
+        const mentions = await resolveMentionsFromEvent(enriched);
         await notify(
-          event,
+          enriched,
           (e) =>
             mentions
               ? prependMentions(formatApprovalCreated(e), mentions)

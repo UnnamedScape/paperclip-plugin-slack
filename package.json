@@ -1,6 +1,6 @@
 {
   "name": "paperclip-plugin-slack",
-  "version": "2.0.7-unnamedscape.3",
+  "version": "2.0.7-unnamedscape.4",
   "type": "module",
   "main": "./dist/index.js",
   "scripts": {

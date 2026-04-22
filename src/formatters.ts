@@ -173,9 +173,19 @@ export function formatApprovalCreated(event: PluginEvent): SlackMessage {
   const agentName = p.agentName ? String(p.agentName) : null;
   const issueIds = Array.isArray(p.issueIds) ? p.issueIds : [];
 
+  // Agents store the PR URL under varying keys — check them in priority order.
+  // Empirical key distribution across current DB: pullRequestUrl > pr > prUrl > pr_url.
+  const prUrl =
+    (typeof p.pullRequestUrl === "string" && p.pullRequestUrl) ||
+    (typeof p.prUrl === "string" && p.prUrl) ||
+    (typeof (p as Record<string, unknown>).pr_url === "string" && (p as Record<string, unknown>).pr_url) ||
+    (typeof (p as Record<string, unknown>).pr === "string" && (p as Record<string, unknown>).pr) ||
+    "";
+
   const fields: Array<{ type: string; text: string }> = [];
   if (agentName) fields.push({ type: "mrkdwn", text: `*Agent*\n${agentName}` });
   fields.push({ type: "mrkdwn", text: `*Type*\n\`${approvalType}\`` });
+  if (prUrl) fields.push({ type: "mrkdwn", text: `*Pull Request*\n<${prUrl}|${prUrl}>` });
   if (issueIds.length > 0) {
     fields.push({ type: "mrkdwn", text: `*Linked Issues*\n${issueIds.join(", ")}` });
   }
