@@ -175,7 +175,9 @@ function cacheAndReturn(companyId: string, data: TeamDirectory): TeamDirectory {
 
 async function resolveMentionsFromEvent(event: PluginEvent): Promise<string> {
   const dir = await fetchTeamDirectory(event.companyId);
-  if (Object.keys(dir.labels).length === 0) return "";
+
+  // Nothing resolvable if directory has neither labels nor users.
+  if (Object.keys(dir.labels).length === 0 && Object.keys(dir.users).length === 0) return "";
 
   const p = event.payload as Record<string, unknown>;
   const issueIds = Array.isArray(p.issueIds) ? (p.issueIds as string[]) : [];
@@ -186,6 +188,25 @@ async function resolveMentionsFromEvent(event: PluginEvent): Promise<string> {
     : {};
   const slackIds = new Set<string>();
 
+  // Per-issue fallback chain: labels → assignee → createdBy (via parent chain).
+  // Stop at the first tier that yields any mention for this particular issue,
+  // then move on. Aggregate across all issues in the payload.
+  const addOwner = (owner: TeamDirectoryOwner | undefined): boolean => {
+    if (!owner) return false;
+    let added = false;
+    if (owner.slackUserId) {
+      slackIds.add(owner.slackUserId);
+      added = true;
+    }
+    if (Array.isArray(owner.slackUserIds)) {
+      for (const u of owner.slackUserIds) {
+        slackIds.add(u);
+        added = true;
+      }
+    }
+    return added;
+  };
+
   for (const iid of issueIds) {
     try {
       const res = await pluginCtx.http.fetch(
@@ -193,15 +214,24 @@ async function resolveMentionsFromEvent(event: PluginEvent): Promise<string> {
         { headers: authHeaders },
       );
       if (!res.ok) continue;
-      const body = (await res.json()) as { labels?: Array<{ name: string }> };
+      const body = (await res.json()) as {
+        labels?: Array<{ name: string }>;
+        assigneeUserId?: string | null;
+      };
+
+      // Tier 1: labels
+      let resolved = false;
       for (const label of body.labels ?? []) {
-        const owner = dir.labels[label.name];
-        if (!owner) continue;
-        if (owner.slackUserId) slackIds.add(owner.slackUserId);
-        if (Array.isArray(owner.slackUserIds)) {
-          for (const u of owner.slackUserIds) slackIds.add(u);
-        }
+        if (addOwner(dir.labels[label.name])) resolved = true;
       }
+      if (resolved) continue;
+
+      // Tier 2: assignee user
+      if (body.assigneeUserId && addOwner(dir.users[body.assigneeUserId])) continue;
+
+      // Tier 3: createdBy chain (walks parent issues up to depth 5)
+      const chainUserId = await resolveUserFromIssueChain(event.companyId, iid);
+      if (chainUserId) addOwner(dir.users[chainUserId]);
     } catch (err) {
       pluginCtx.logger.warn("resolveMentions: issue fetch failed", {
         issueId: iid,
@@ -1410,9 +1440,69 @@ const plugin = definePlugin({
 
     // notify-board: agent-invoked Slack @mention. See handleNotifyBoardAction
     // above for chain walk + team-directory resolution + Slack post logic.
+    //
+    // Registered in TWO shapes:
+    //   1. `ctx.actions.register("notify-board", ...)` — invoked via the UI
+    //      bridge (`POST /api/plugins/:pluginId/actions/:key`). That route is
+    //      Board-only (`assertBoardOrgAccess`) so agents cannot use it.
+    //   2. `ctx.tools.register("notify_board", ...)` — invoked as an agent tool
+    //      by the Claude runtime. Same handler, companyId sourced from the
+    //      agent's runCtx instead of the body.
     ctx.actions.register("notify-board", async (params) => {
       return handleNotifyBoardAction(params as Record<string, unknown>);
     });
+
+    ctx.tools.register(
+      "notify_board",
+      {
+        displayName: "Notify Board (Slack @mention)",
+        description:
+          "Posts an @-mentioned notification to the Board's Slack channel about an issue. " +
+          "Resolves the recipient by walking the issue's parent chain to find the original " +
+          "createdByUserId, then looking it up in team-directory.users. Use this when control " +
+          "hands off to the Board (e.g. approval created, approval revision resubmitted).",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            issueId: {
+              type: "string",
+              description: "Paperclip issue UUID that the Board should look at.",
+            },
+            reason: {
+              type: "string",
+              description:
+                "Short human-readable reason why the Board needs to act (appears in the Slack message body).",
+            },
+            approvalId: {
+              type: "string",
+              description:
+                "Optional approval UUID to link from the Slack message. When present, the message renders a 'Open approval' link.",
+            },
+            prUrl: {
+              type: "string",
+              description:
+                "Optional GitHub PR URL. If omitted, the action falls back to approval.payload.pullRequestUrl when approvalId is set.",
+            },
+            channelId: {
+              type: "string",
+              description:
+                "Optional Slack channel override. Defaults to approvalsChannelId, then defaultChannelId from plugin config.",
+            },
+          },
+          required: ["issueId", "reason"],
+        },
+      },
+      async (params: unknown, runCtx) => {
+        const p = (params as Record<string, unknown>) ?? {};
+        // runCtx.companyId is authoritative for agent calls — ignore any
+        // companyId the agent may have supplied in params.
+        const result = await handleNotifyBoardAction({
+          ...p,
+          companyId: runCtx.companyId,
+        });
+        return { content: JSON.stringify(result) };
+      },
+    );
 
     // =========================================================================
     // Jobs
