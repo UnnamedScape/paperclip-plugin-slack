@@ -209,11 +209,18 @@ async function resolveMentionsFromEvent(event: PluginEvent): Promise<string> {
 
   for (const iid of issueIds) {
     try {
-      const res = await pluginCtx.http.fetch(
-        `${pluginConfig.paperclipBaseUrl}/api/companies/${event.companyId}/issues/${iid}`,
-        { headers: authHeaders },
-      );
-      if (!res.ok) continue;
+      // Correct route is `/api/issues/:id`. The old `/api/companies/:companyId/issues/:id`
+      // path does not exist and silently 404'd, making Tier 1–3 all no-op.
+      const url = `${pluginConfig.paperclipBaseUrl}/api/issues/${iid}`;
+      const res = await pluginCtx.http.fetch(url, { headers: authHeaders });
+      if (!res.ok) {
+        pluginCtx.logger.warn("resolveMentions: issue fetch non-OK", {
+          issueId: iid,
+          status: res.status,
+          url,
+        });
+        continue;
+      }
       const body = (await res.json()) as {
         labels?: Array<{ name: string }>;
         assigneeUserId?: string | null;
@@ -250,14 +257,23 @@ async function resolveUserFromIssueChain(companyId: string, startIssueId: string
   const authHeaders: Record<string, string> = paperclipApiKey
     ? { Authorization: `Bearer ${paperclipApiKey}` }
     : {};
+  // companyId is no longer part of the URL — paperclip exposes `/api/issues/:id`
+  // at the top level and enforces company scope via session/auth. Kept as a
+  // parameter for call-site symmetry and future use.
+  void companyId;
   let currentId: string | null = startIssueId;
   for (let depth = 0; depth < 5 && currentId; depth += 1) {
     try {
-      const res = await pluginCtx.http.fetch(
-        `${pluginConfig.paperclipBaseUrl}/api/companies/${companyId}/issues/${currentId}`,
-        { headers: authHeaders },
-      );
-      if (!res.ok) return null;
+      const url = `${pluginConfig.paperclipBaseUrl}/api/issues/${currentId}`;
+      const res = await pluginCtx.http.fetch(url, { headers: authHeaders });
+      if (!res.ok) {
+        pluginCtx.logger.warn("resolveUserFromIssueChain: issue fetch non-OK", {
+          issueId: currentId,
+          status: res.status,
+          url,
+        });
+        return null;
+      }
       const issue = (await res.json()) as { createdByUserId?: string | null; parentId?: string | null };
       if (issue.createdByUserId) return issue.createdByUserId;
       currentId = issue.parentId ?? null;
@@ -316,13 +332,19 @@ async function handleNotifyBoardAction(params: Record<string, unknown>): Promise
     ? { Authorization: `Bearer ${paperclipApiKey}` }
     : {};
 
-  // Fetch issue for link context
+  // Fetch issue for link context. Route is `/api/issues/:id` — the previous
+  // `/api/companies/:companyId/issues/:id` shape doesn't exist (silent 404).
   let issueLink = "";
   try {
-    const res = await pluginCtx.http.fetch(
-      `${pluginConfig.paperclipBaseUrl}/api/companies/${companyId}/issues/${issueId}`,
-      { headers: authHeaders },
-    );
+    const url = `${pluginConfig.paperclipBaseUrl}/api/issues/${issueId}`;
+    const res = await pluginCtx.http.fetch(url, { headers: authHeaders });
+    if (!res.ok) {
+      pluginCtx.logger.warn("notify-board: issue fetch non-OK", {
+        issueId,
+        status: res.status,
+        url,
+      });
+    }
     if (res.ok) {
       const issue = (await res.json()) as { identifier?: string; title?: string };
       if (issue.identifier) {
