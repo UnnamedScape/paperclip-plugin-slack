@@ -248,6 +248,7 @@ async function handleNotifyBoardAction(params: Record<string, unknown>): Promise
   const reason = String(params.reason ?? "");
   const approvalId = params.approvalId ? String(params.approvalId) : null;
   const channelOverride = params.channelId ? String(params.channelId) : null;
+  const explicitPrUrl = params.prUrl ? String(params.prUrl) : null;
 
   if (!companyId || !issueId || !reason) {
     return { ok: false, reason: "missing_required_fields" };
@@ -274,17 +275,20 @@ async function handleNotifyBoardAction(params: Record<string, unknown>): Promise
     return { ok: false, reason: "user_not_in_directory", notifiedUserId: resolvedUserId };
   }
 
-  const channelId = channelOverride ?? pluginConfig.approvalsChannelId ?? pluginConfig.defaultChannelId;
+  // Channel resolve — use `||` so empty string falls through to default.
+  // `??` only fallbacks on null/undefined, which leaked `""` through.
+  const channelId = channelOverride || pluginConfig.approvalsChannelId || pluginConfig.defaultChannelId;
   if (!channelId) {
     return { ok: false, reason: "no_channel_configured" };
   }
 
+  const authHeaders: Record<string, string> = paperclipApiKey
+    ? { Authorization: `Bearer ${paperclipApiKey}` }
+    : {};
+
   // Fetch issue for link context
   let issueLink = "";
   try {
-    const authHeaders: Record<string, string> = paperclipApiKey
-      ? { Authorization: `Bearer ${paperclipApiKey}` }
-      : {};
     const res = await pluginCtx.http.fetch(
       `${pluginConfig.paperclipBaseUrl}/api/companies/${companyId}/issues/${issueId}`,
       { headers: authHeaders },
@@ -298,12 +302,32 @@ async function handleNotifyBoardAction(params: Record<string, unknown>): Promise
     }
   } catch { /* best-effort */ }
 
+  // Resolve PR URL — explicit param preferred; fall back to approval.payload
+  // fields agents conventionally set (pullRequestUrl / prUrl / pr_url).
+  let prUrl = explicitPrUrl ?? "";
+  if (!prUrl && approvalId) {
+    try {
+      const res = await pluginCtx.http.fetch(
+        `${pluginConfig.paperclipBaseUrl}/api/approvals/${approvalId}`,
+        { headers: authHeaders },
+      );
+      if (res.ok) {
+        const approval = (await res.json()) as { payload?: Record<string, unknown> | null };
+        const payload = approval.payload ?? {};
+        prUrl = String(payload.pullRequestUrl ?? payload.prUrl ?? payload.pr_url ?? "");
+      }
+    } catch { /* best-effort */ }
+  }
+  const prLink = prUrl ? `<${prUrl}|PR>` : "";
+
   const approvalLink = approvalId
     ? `<${pluginConfig.paperclipBaseUrl}/approvals/${approvalId}|Approval>`
     : "";
 
   const mention = `<@${owner.slackUserId}>`;
   const textParts = [`${mention} 🔔 Board 확인 요청`, reason];
+  // Link order: most actionable first (PR) → context (issue) → tracking (approval).
+  if (prLink) textParts.push(prLink);
   if (issueLink) textParts.push(issueLink);
   if (approvalLink) textParts.push(approvalLink);
   const text = textParts.join("\n");
