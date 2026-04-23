@@ -288,10 +288,134 @@ async function resolveUserFromIssueChain(companyId: string, startIssueId: string
   return null;
 }
 
+// Regex for GitHub PR URLs embedded in payloads or comments.
+const GH_PR_URL_RE = /https:\/\/github\.com\/[^\s)"'<>]+\/pull\/\d+/;
+
+function scrapeGhPrUrl(text: string | null | undefined): string | null {
+  if (!text) return null;
+  const m = text.match(GH_PR_URL_RE);
+  return m ? m[0] : null;
+}
+
+// Scan the most-recent comments of a single issue for a GitHub PR URL.
+// Agents conventionally post the review-request comment with an inline PR
+// link ("[PR #19](https://...)") right next to the approval reference.
+async function findPrUrlInIssueComments(
+  issueId: string,
+  authHeaders: Record<string, string>,
+): Promise<string | null> {
+  try {
+    const url = `${pluginConfig.paperclipBaseUrl}/api/issues/${issueId}/comments`;
+    const res = await pluginCtx.http.fetch(url, { headers: authHeaders });
+    if (!res.ok) return null;
+    const comments = (await res.json()) as Array<{
+      body?: string | null;
+      createdAt?: string | null;
+    }>;
+    const sorted = [...comments].sort((a, b) =>
+      String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")),
+    );
+    for (const c of sorted) {
+      const hit = scrapeGhPrUrl(c.body ?? "");
+      if (hit) return hit;
+    }
+  } catch (err) {
+    pluginCtx.logger.warn("findPrUrlInIssueComments: error", {
+      issueId,
+      err: String(err),
+    });
+  }
+  return null;
+}
+
+// Backwards lookup: when approval.issueIds is null, walk recent company
+// issues and find the comment that mentions this approval id. That comment
+// is almost always the agent's "review request" note which also embeds the
+// PR URL — we get both the linking issue and the PR URL in one pass.
+async function findApprovalReferenceBackwards(
+  approvalId: string,
+  companyId: string,
+  authHeaders: Record<string, string>,
+): Promise<{ prUrl: string | null; issueId: string | null } | null> {
+  if (!companyId) return null;
+  try {
+    const listUrl = `${pluginConfig.paperclipBaseUrl}/api/companies/${companyId}/issues?limit=30`;
+    const listRes = await pluginCtx.http.fetch(listUrl, { headers: authHeaders });
+    if (!listRes.ok) return null;
+    const issues = (await listRes.json()) as Array<{
+      id: string;
+      lastActivityAt?: string | null;
+    }>;
+    const sorted = [...issues].sort((a, b) =>
+      String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")),
+    );
+    // Limit fan-out to the 15 most recently active issues — the approval was
+    // just created, so the referencing comment lives on an actively touched issue.
+    for (const iss of sorted.slice(0, 15)) {
+      const cUrl = `${pluginConfig.paperclipBaseUrl}/api/issues/${iss.id}/comments`;
+      const cRes = await pluginCtx.http.fetch(cUrl, { headers: authHeaders });
+      if (!cRes.ok) continue;
+      const comments = (await cRes.json()) as Array<{ body?: string | null }>;
+      for (const c of comments) {
+        const body = c.body ?? "";
+        if (body.includes(approvalId)) {
+          return { prUrl: scrapeGhPrUrl(body), issueId: iss.id };
+        }
+      }
+    }
+  } catch (err) {
+    pluginCtx.logger.warn("findApprovalReferenceBackwards: error", {
+      approvalId,
+      err: String(err),
+    });
+  }
+  return null;
+}
+
+// Posts a one-line warning on the linked issue when plugin had to repair the
+// approval payload. Intentionally best-effort: failure to post the warning
+// must not block the main Slack forward.
+async function postEnrichmentWarning(
+  issueId: string,
+  approvalId: string,
+  missing: string[],
+  authHeaders: Record<string, string>,
+): Promise<void> {
+  try {
+    const url = `${pluginConfig.paperclipBaseUrl}/api/issues/${issueId}/comments`;
+    const body = {
+      body:
+        `⚠️ **자동 경고** — approval \`${approvalId}\` payload 가 불완전합니다 ` +
+        `(누락: ${missing.join(", ")}). slack plugin 이 자동 보강해 Board 알림은 ` +
+        `정상 발송됐지만, **프로세스 위반 가능성** (SE premature 생성 의심). ` +
+        `\`speckit-workflow\` Engineer 5번 참조 — SE 는 approval 생성 금지. ` +
+        `CTO 는 이 approval 이 본인이 만든 것이 아니라면 reject 후 리뷰 통과 시점에 재생성.`,
+    };
+    await pluginCtx.http.fetch(url, {
+      method: "POST",
+      headers: { ...authHeaders, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    pluginCtx.logger.warn("postEnrichmentWarning: error", {
+      issueId,
+      approvalId,
+      err: String(err),
+    });
+  }
+}
+
 // approval.created events arrive with a minimal payload derived from the
 // activity_log entry ({type, issueIds}). The richer per-approval data — title,
 // description, pullRequestUrl, etc. — lives on the approval row's `payload`
 // jsonb. Fetch and merge so the downstream formatter can render a useful card.
+//
+// Also performs recovery enrichment when an agent (typically SE) creates an
+// approval without a pullRequestUrl or issueIds. We try to discover the PR
+// URL from payload text, linked-issue comments, then a backwards search for
+// any comment referencing the approval id. On repair, we tag the merged
+// payload with `_enrichmentRepaired` + `_enrichmentMissing` for the formatter
+// and post a best-effort warning on the linked issue.
 async function enrichApprovalEvent(event: PluginEvent): Promise<PluginEvent> {
   const approvalId = String(event.entityId ?? "");
   if (!approvalId) return event;
@@ -312,17 +436,76 @@ async function enrichApprovalEvent(event: PluginEvent): Promise<PluginEvent> {
     const approval = (await res.json()) as {
       payload?: Record<string, unknown>;
       type?: string;
+      issueIds?: string[] | null;
       requestedByAgentId?: string | null;
     };
     const base = (event.payload as Record<string, unknown>) ?? {};
+    const payload = approval.payload ?? {};
+
+    let prUrl: string | null =
+      (typeof payload.pullRequestUrl === "string" && payload.pullRequestUrl) ||
+      (typeof payload.prUrl === "string" && (payload.prUrl as string)) ||
+      (typeof (payload as Record<string, unknown>).pr_url === "string" &&
+        ((payload as Record<string, unknown>).pr_url as string)) ||
+      (typeof (payload as Record<string, unknown>).pr === "string" &&
+        ((payload as Record<string, unknown>).pr as string)) ||
+      null;
+
+    let resolvedIssueIds: string[] | null =
+      approval.issueIds && approval.issueIds.length > 0 ? approval.issueIds : null;
+
+    const missingReasons: string[] = [];
+    if (!prUrl) missingReasons.push("pullRequestUrl");
+    if (!resolvedIssueIds) missingReasons.push("issueIds");
+
+    // Stage 1: scrape existing payload text.
+    if (!prUrl) {
+      prUrl = scrapeGhPrUrl(JSON.stringify(payload));
+    }
+
+    // Stage 2: walk linked issues' comments when issueIds known.
+    if (!prUrl && resolvedIssueIds) {
+      for (const iid of resolvedIssueIds) {
+        prUrl = await findPrUrlInIssueComments(iid, authHeaders);
+        if (prUrl) break;
+      }
+    }
+
+    // Stage 3: backwards search on recent company issues for a comment that
+    // references this approval id — yields both PR URL and the linking issue.
+    if (!prUrl || !resolvedIssueIds) {
+      const hit = await findApprovalReferenceBackwards(
+        approvalId,
+        String(event.companyId ?? ""),
+        authHeaders,
+      );
+      if (hit) {
+        if (!prUrl && hit.prUrl) prUrl = hit.prUrl;
+        if (!resolvedIssueIds && hit.issueId) resolvedIssueIds = [hit.issueId];
+      }
+    }
+
+    const repaired = missingReasons.length > 0;
+
     const merged: Record<string, unknown> = {
       ...base,
-      ...(approval.payload ?? {}),
+      ...payload,
       approvalId,
+      ...(prUrl ? { pullRequestUrl: prUrl } : {}),
+      ...(resolvedIssueIds ? { issueIds: resolvedIssueIds } : {}),
     };
-    // activity_log.details already carries `type`; prefer it over payload in case
-    // the agent nested a different semantic `type` field inside payload.
     if (base.type !== undefined) merged.type = base.type;
+    if (repaired) {
+      merged._enrichmentRepaired = true;
+      merged._enrichmentMissing = missingReasons;
+      const warnIssueId = resolvedIssueIds?.[0];
+      if (warnIssueId) {
+        postEnrichmentWarning(warnIssueId, approvalId, missingReasons, authHeaders).catch(
+          () => {},
+        );
+      }
+    }
+
     return { ...event, payload: merged };
   } catch (err) {
     pluginCtx.logger.warn("enrichApprovalEvent: error", {

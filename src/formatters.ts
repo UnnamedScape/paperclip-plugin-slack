@@ -202,6 +202,24 @@ export function formatApprovalCreated(event: PluginEvent): SlackMessage {
     },
   ];
 
+  // Plugin may have had to repair a payload the agent submitted incomplete —
+  // most often a premature SE-created approval (UNN-78, UNN-79). Surface that
+  // up-front so Board reviewers know this arrived out of process.
+  if ((p as Record<string, unknown>)._enrichmentRepaired === true) {
+    const missing = Array.isArray((p as Record<string, unknown>)._enrichmentMissing)
+      ? ((p as Record<string, unknown>)._enrichmentMissing as string[]).join(", ")
+      : "fields";
+    blocks.push({
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `:warning: _Payload was auto-repaired (missing: ${missing}). Likely SE-created before CTO review — verify with CTO before approving._`,
+        },
+      ],
+    });
+  }
+
   if (fields.length > 0) {
     blocks.push({ type: "section", fields });
   }
