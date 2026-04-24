@@ -258,6 +258,27 @@ export function formatApprovalCreated(event: PluginEvent): SlackMessage {
   };
 }
 
+// Resubmit rides the same render as creation (same payload surface + same
+// set of Approve / Reject / View actions are relevant) — we just swap the
+// headline so Board can distinguish "new request" from "revised request".
+// This fires on approval.resubmitted which paperclip only forwards after
+// the local patch in deploy.sh registers it in PLUGIN_EVENT_TYPES.
+export function formatApprovalResubmitted(event: PluginEvent): SlackMessage {
+  const msg = formatApprovalCreated(event);
+  if (Array.isArray(msg.blocks) && msg.blocks.length > 0) {
+    const header = msg.blocks[0] as { type?: string; text?: { type?: string; text?: string } };
+    if (header.type === "section" && header.text?.text) {
+      header.text.text = header.text.text
+        .replace(
+          "*Approval requested* :rotating_light:",
+          "*Approval resubmitted* :arrows_counterclockwise:",
+        );
+    }
+  }
+  msg.text = `Approval resubmitted for ${String(event.entityId ?? "")}`;
+  return msg;
+}
+
 export function formatApprovalResolved(
   approvalId: string,
   approved: boolean,

@@ -30,6 +30,7 @@ import {
   formatIssueCreated,
   formatIssueDone,
   formatApprovalCreated,
+  formatApprovalResubmitted,
   formatApprovalResolved,
   formatAgentError,
   formatAgentConnected,
@@ -1601,6 +1602,25 @@ const plugin = definePlugin({
             mentions
               ? prependMentions(formatApprovalCreated(e), mentions)
               : formatApprovalCreated(e),
+          config.approvalsChannelId,
+        );
+      });
+
+      // approval.resubmitted is not in upstream paperclip's PLUGIN_EVENT_TYPES
+      // whitelist; our deploy.sh patches it in. Without that patch this
+      // handler is registered but never fires. Once patched, resubmitted
+      // approvals produce a Board notification just like fresh ones.
+      // ts-cast: "approval.resubmitted" is runtime-valid after the deploy.sh
+      // patch but absent from the installed plugin-sdk's PluginEventType union.
+      ctx.events.on("approval.resubmitted" as Parameters<typeof ctx.events.on>[0], async (event: PluginEvent) => {
+        const enriched = await enrichApprovalEvent(event);
+        const mentions = await resolveMentionsFromEvent(enriched);
+        await notify(
+          enriched,
+          (e) =>
+            mentions
+              ? prependMentions(formatApprovalResubmitted(e), mentions)
+              : formatApprovalResubmitted(e),
           config.approvalsChannelId,
         );
       });
