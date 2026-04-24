@@ -389,7 +389,7 @@ async function postEnrichmentWarning(
         `⚠️ **자동 경고** — approval \`${approvalId}\` payload 가 불완전합니다 ` +
         `(누락: ${missing.join(", ")}). slack plugin 이 자동 보강해 Board 알림은 ` +
         `정상 발송됐지만, **프로세스 위반 가능성** (SE premature 생성 의심). ` +
-        `\`speckit-workflow\` Engineer 5번 참조 — SE 는 approval 생성 금지. ` +
+        `\`speckit-workflow-engineer\` / \`speckit-workflow-lead\` 참조 — approval 작성자는 CTO/CEO 뿐. ` +
         `CTO 는 이 approval 이 본인이 만든 것이 아니라면 reject 후 리뷰 통과 시점에 재생성.`,
     };
     await pluginCtx.http.fetch(url, {
